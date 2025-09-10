@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import http from "http";
 import { z } from "zod";
@@ -19,28 +20,44 @@ const originalWrite = process.stdout.write;
 process.stdout.write = () => true;
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 process.stdout.write = originalWrite;
-// Config paths
+// Config paths - for local development
 const CONFIG_DIR = path.join(os.homedir(), ".quickbooks-mcp");
 const CREDS_PATH = path.join(CONFIG_DIR, "credentials.json");
 // Load env
 const CLIENT_ID = process.env.QB_CLIENT_ID;
 const CLIENT_SECRET = process.env.QB_CLIENT_SECRET;
-const REDIRECT_URI = "http://localhost:3000/callback";
+const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3000/callback";
 const QB_BASE = "https://sandbox-quickbooks.api.intuit.com/v3/company";
 const REALM_ID = process.env.QB_REALM_ID;
+const PORT = process.env.PORT || 3000;
 // Use a supported minor version (>=75)
 const MINOR_VERSION = 75;
 let tokens = null;
-// Save/load tokens
+// Save/load tokens - modified for serverless environment
 function saveTokens(newTokens) {
-    if (!fs.existsSync(CONFIG_DIR))
-        fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(CREDS_PATH, JSON.stringify(newTokens, null, 2));
+    if (process.env.VERCEL) {
+        // In Vercel, we can't write to filesystem, so we'll need to use external storage
+        // For now, we'll just keep tokens in memory (they'll be lost on cold starts)
+        tokens = newTokens;
+        console.error("Tokens saved to memory (Vercel environment)");
+    }
+    else {
+        if (!fs.existsSync(CONFIG_DIR))
+            fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        fs.writeFileSync(CREDS_PATH, JSON.stringify(newTokens, null, 2));
+    }
 }
 // Load saved tokens
 function loadTokens() {
-    if (fs.existsSync(CREDS_PATH)) {
+    if (!process.env.VERCEL && fs.existsSync(CREDS_PATH)) {
         tokens = JSON.parse(fs.readFileSync(CREDS_PATH, "utf8"));
+    }
+    else if (process.env.QB_ACCESS_TOKEN && process.env.QB_REFRESH_TOKEN) {
+        // Load from environment variables for production
+        tokens = {
+            access_token: process.env.QB_ACCESS_TOKEN,
+            refresh_token: process.env.QB_REFRESH_TOKEN,
+        };
     }
 }
 // --- OAuth2 helpers ---
@@ -70,13 +87,15 @@ async function refreshTokens() {
     tokens = { ...(tokens ?? {}), ...(data ?? {}) };
     saveTokens(tokens);
 }
-// Authenticate user
+// Authenticate user - modified for web environment
 async function authenticate() {
     const app = express();
     const server = http.createServer(app);
     const authUrl = `https://appcenter.intuit.com/connect/oauth2?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=com.intuit.quickbooks.accounting&state=12345`;
     console.log("Open this URL to authorize:", authUrl);
-    open(authUrl);
+    if (!process.env.VERCEL) {
+        open(authUrl);
+    }
     return new Promise((resolve, reject) => {
         app.get("/callback", async (req, res) => {
             const code = req.query.code;
@@ -98,7 +117,19 @@ async function authenticate() {
                 const data = await resp.json();
                 tokens = data;
                 saveTokens(tokens);
-                res.send("Authentication successful! You can close this window.");
+                res.send(`
+          <html>
+            <body>
+              <h2>Authentication successful!</h2>
+              <p>Your tokens:</p>
+              <pre>${JSON.stringify(tokens, null, 2)}</pre>
+              <p><strong>Save these environment variables for production:</strong></p>
+              <pre>QB_ACCESS_TOKEN=${tokens.access_token}
+QB_REFRESH_TOKEN=${tokens.refresh_token}</pre>
+              <p>You can close this window.</p>
+            </body>
+          </html>
+        `);
                 server.close();
                 resolve();
             }
@@ -106,7 +137,7 @@ async function authenticate() {
                 reject(err);
             }
         });
-        server.listen(3000, () => console.log("Listening on 3000 for callback"));
+        server.listen(PORT, () => console.log(`Listening on ${PORT} for callback`));
     });
 }
 /**
@@ -307,13 +338,8 @@ const searchSchema = z.object({
     orderBy: z.enum(["Id", "DisplayName", "Metadata.LastUpdatedTime"]).default("Metadata.LastUpdatedTime"),
     sort: z.enum(["ASC", "DESC"]).default("DESC"),
 });
-// --- MAIN ---
-async function main() {
-    loadTokens();
-    if (process.argv[2] === "auth") {
-        await authenticate();
-        process.exit(0);
-    }
+// --- MCP Server Setup ---
+function createMcpServer() {
     const server = new McpServer({
         name: "quickbooks",
         version: "1.0.0",
@@ -432,11 +458,109 @@ async function main() {
             content: [{ type: "text", text: JSON.stringify(hit, null, 2) }],
         };
     });
+    return server;
+}
+// --- Express App for Web Deployment ---
+function createExpressApp() {
+    const app = express();
+    // Health check endpoint
+    app.get("/", (req, res) => {
+        res.json({
+            status: "ok",
+            message: "QuickBooks MCP Server",
+            authenticated: !!tokens?.access_token
+        });
+    });
+    // OAuth callback endpoint
+    app.get("/callback", async (req, res) => {
+        const code = req.query.code;
+        if (!code) {
+            return res.status(400).send("No authorization code provided");
+        }
+        try {
+            const resp = await fetch("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer", {
+                method: "POST",
+                headers: {
+                    Authorization: "Basic " +
+                        Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body: `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`,
+            });
+            if (!resp.ok) {
+                throw new Error(`Token exchange failed: ${resp.status}`);
+            }
+            const data = await resp.json();
+            tokens = data;
+            saveTokens(tokens);
+            res.send(`
+        <html>
+          <body>
+            <h2>Authentication successful!</h2>
+            <p><strong>Save these environment variables for production:</strong></p>
+            <pre>QB_ACCESS_TOKEN=${tokens.access_token}
+QB_REFRESH_TOKEN=${tokens.refresh_token}</pre>
+            <p>You can close this window.</p>
+          </body>
+        </html>
+      `);
+        }
+        catch (error) {
+            console.error("OAuth callback error:", error);
+            res.status(500).send("Authentication failed");
+        }
+    });
+    // SSE endpoint for MCP
+    app.get("/sse", async (req, res) => {
+        try {
+            const server = createMcpServer();
+            const transport = new SSEServerTransport("/sse", res);
+            await server.connect(transport);
+        }
+        catch (error) {
+            console.error("SSE connection error:", error);
+            res.status(500).json({ error: "Failed to establish SSE connection" });
+        }
+    });
+    return app;
+}
+// --- MAIN ---
+async function main() {
+    loadTokens();
+    if (process.argv[2] === "auth") {
+        await authenticate();
+        process.exit(0);
+    }
+    // For web deployment (Vercel)
+    if (process.env.VERCEL || process.argv[2] === "web") {
+        const app = createExpressApp();
+        const port = process.env.PORT || 3000;
+        if (!process.env.VERCEL) {
+            app.listen(port, () => {
+                console.log(`QuickBooks MCP Server running on http://localhost:${port}`);
+                console.log(`SSE endpoint: http://localhost:${port}/sse`);
+            });
+        }
+        return;
+    }
+    // For local stdio usage (original behavior)
+    const server = createMcpServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("QuickBooks MCP server running with tools: get_customer_by_id, list_customers, search_customers, create_customer, update_customer, set_customer_active, get_customer_by_display_name");
 }
-main().catch((err) => {
-    console.error("Fatal:", err);
-    process.exit(1);
-});
+// For Vercel deployment - create and export the app
+let app = null;
+if (process.env.VERCEL) {
+    loadTokens();
+    app = createExpressApp();
+}
+// Handle direct execution
+if (!process.env.VERCEL) {
+    main().catch((err) => {
+        console.error("Fatal:", err);
+        process.exit(1);
+    });
+}
+// Export for Vercel (this needs to be at module level)
+export default app;
