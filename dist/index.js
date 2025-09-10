@@ -465,6 +465,8 @@ function createExpressApp() {
     const app = express();
     // Add JSON parsing middleware
     app.use(express.json());
+    // Store active transports by session ID
+    const activeTransports = new Map();
     // Health check endpoint
     app.get("/", (req, res) => {
         res.json({
@@ -517,16 +519,54 @@ QB_REFRESH_TOKEN=${tokens.refresh_token}</pre>
             res.status(500).send("Authentication failed");
         }
     });
-    // SSE endpoint for MCP - handle both GET and POST
-    app.all("/sse", async (req, res) => {
+    // SSE endpoint for MCP - establish connection and send endpoint event
+    app.get("/sse", async (req, res) => {
         try {
+            console.log("New SSE connection request");
+            // Set up SSE headers
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Cache-Control',
+            });
+            // Create server and transport
             const server = createMcpServer();
-            const transport = new SSEServerTransport("/sse", res);
+            const transport = new SSEServerTransport("/messages", res);
+            // Store transport for message handling
+            const sessionId = transport.sessionId || 'default';
+            activeTransports.set(sessionId, transport);
+            // Clean up on disconnect
+            res.on('close', () => {
+                console.log(`SSE connection closed for session: ${sessionId}`);
+                activeTransports.delete(sessionId);
+            });
+            // Connect server to transport
             await server.connect(transport);
+            console.log(`SSE connection established for session: ${sessionId}`);
         }
         catch (error) {
             console.error("SSE connection error:", error);
             res.status(500).json({ error: "Failed to establish SSE connection" });
+        }
+    });
+    // Message endpoint for MCP JSON-RPC
+    app.post("/messages", async (req, res) => {
+        try {
+            console.log("Message received:", JSON.stringify(req.body, null, 2));
+            const sessionId = req.query.sessionId || 'default';
+            const transport = activeTransports.get(sessionId);
+            if (!transport) {
+                console.error(`No transport found for session: ${sessionId}`);
+                return res.status(400).json({ error: "No active transport found" });
+            }
+            // Handle the message through the transport
+            await transport.handlePostMessage(req, res, req.body);
+        }
+        catch (error) {
+            console.error("Message handling error:", error);
+            res.status(500).json({ error: "Failed to handle message" });
         }
     });
     return app;
