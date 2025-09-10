@@ -30,7 +30,7 @@ const CREDS_PATH = path.join(CONFIG_DIR, "credentials.json");
 // Load env
 const CLIENT_ID = process.env.QB_CLIENT_ID!;
 const CLIENT_SECRET = process.env.QB_CLIENT_SECRET!;
-const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3000/callback";
+const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3001/callback";
 const QB_BASE = "https://sandbox-quickbooks.api.intuit.com/v3/company";
 const REALM_ID = process.env.QB_REALM_ID!;
 const PORT = process.env.PORT || 3000;
@@ -570,6 +570,9 @@ function createMcpServer() {
 function createExpressApp() {
   const app = express();
   
+  // Add JSON parsing middleware
+  app.use(express.json());
+  
   // Health check endpoint
   app.get("/", (req, res) => {
     res.json({ 
@@ -577,6 +580,15 @@ function createExpressApp() {
       message: "QuickBooks MCP Server",
       authenticated: !!tokens?.access_token 
     });
+  });
+
+  // OAuth initiation endpoint
+  app.get("/auth", (req, res) => {
+    const authUrl = `https://appcenter.intuit.com/connect/oauth2?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(
+      REDIRECT_URI
+    )}&response_type=code&scope=com.intuit.quickbooks.accounting&state=12345`;
+    
+    res.redirect(authUrl);
   });
 
   // OAuth callback endpoint
@@ -628,8 +640,8 @@ QB_REFRESH_TOKEN=${tokens.refresh_token}</pre>
     }
   });
 
-  // SSE endpoint for MCP
-  app.get("/sse", async (req, res) => {
+  // SSE endpoint for MCP - handle both GET and POST
+  app.all("/sse", async (req, res) => {
     try {
       const server = createMcpServer();
       const transport = new SSEServerTransport("/sse", res);
@@ -656,7 +668,7 @@ async function main() {
   // For web deployment (Vercel)
   if (process.env.VERCEL || process.argv[2] === "web") {
     const app = createExpressApp();
-    const port = process.env.PORT || 3000;
+    const port = process.env.PORT || 3001;
     
     if (!process.env.VERCEL) {
       app.listen(port, () => {
