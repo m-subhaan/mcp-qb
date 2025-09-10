@@ -48,15 +48,15 @@ async function testSSEEndpoint() {
   }
 }
 
-// Test 3: Test MCP protocol handshake
+// Test 3: Test MCP protocol handshake (updated to use /messages endpoint)
 async function testMCPHandshake() {
   console.log('🔍 Testing MCP protocol handshake...');
   try {
-    const response = await fetch(`${MCP_SERVER_URL}/sse`, {
+    const response = await fetch(`${MCP_SERVER_URL}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
+        'Accept': 'application/json',
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -79,8 +79,10 @@ async function testMCPHandshake() {
     });
 
     console.log('📊 MCP Handshake Status:', response.status);
-    if (response.status === 200) {
+    if (response.status === 200 || response.status === 202) {
       console.log('✅ MCP handshake successful');
+      const text = await response.text();
+      console.log('Response:', text);
       return true;
     } else {
       console.error('❌ MCP handshake failed');
@@ -124,10 +126,10 @@ function generateCurlCommand() {
   console.log('\n2. SSE endpoint:');
   console.log(`curl -X GET "${MCP_SERVER_URL}/sse" -H "Accept: text/event-stream"`);
   
-  console.log('\n3. MCP Initialize:');
-  console.log(`curl -X POST "${MCP_SERVER_URL}/sse" \\
+  console.log('\n3. MCP Initialize (corrected endpoint):');
+  console.log(`curl -X POST "${MCP_SERVER_URL}/messages" \\
   -H "Content-Type: application/json" \\
-  -H "Accept: text/event-stream" \\
+  -H "Accept: application/json" \\
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
@@ -143,6 +145,40 @@ function generateCurlCommand() {
   }'`);
 }
 
+// Test 6: Test tools listing
+async function testToolsListing() {
+  console.log('🔍 Testing tools listing...');
+  try {
+    const response = await fetch(`${MCP_SERVER_URL}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/list'
+      })
+    });
+
+    console.log('📊 Tools List Status:', response.status);
+    if (response.status === 200 || response.status === 202) {
+      const text = await response.text();
+      console.log('✅ Tools list response:', text);
+      return true;
+    } else {
+      console.error('❌ Tools listing failed');
+      const text = await response.text();
+      console.error('Response:', text);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Tools listing error:', error.message);
+    return false;
+  }
+}
+
 // Main test runner
 async function runAllTests() {
   console.log('🚀 Starting MCP Server Tests...\n');
@@ -151,6 +187,7 @@ async function runAllTests() {
     healthCheck: await testHealthCheck(),
     sseEndpoint: await testSSEEndpoint(),
     mcpHandshake: await testMCPHandshake(),
+    toolsListing: await testToolsListing(),
     authentication: await testAuthentication()
   };
   

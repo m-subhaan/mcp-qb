@@ -742,12 +742,14 @@ async function main() {
 
 // For Vercel deployment - create and export the app
 let app: any = null;
+
+// Always create app for Vercel, but only load tokens in Vercel environment
 if (process.env.VERCEL) {
   loadTokens();
-  app = createExpressApp();
 }
+app = createExpressApp();
 
-// Handle direct execution
+// Handle direct execution (non-Vercel)
 if (!process.env.VERCEL) {
   main().catch((err) => {
     console.error("Fatal:", err);
