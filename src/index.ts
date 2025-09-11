@@ -211,6 +211,12 @@ async function getCustomerRaw(id: string): Promise<any> {
   return data?.Customer;
 }
 
+// Fetch latest Account (for SyncToken on update)
+async function getAccountRaw(id: string): Promise<any> {
+  const data = await qbRequest(`account/${id}`, { method: "GET" });
+  return data?.Account;
+}
+
 // Map simplified input to QBO Customer shape
 function mapCustomerInputToQBO(input: any) {
   const qbo: any = {};
@@ -257,11 +263,38 @@ function mapCustomerInputToQBO(input: any) {
   return qbo;
 }
 
+// Map simplified input to QBO Account shape
+function mapAccountInputToQBO(input: any) {
+  const qbo: any = {};
+
+  // Commonly used Account fields
+  if (input.name) qbo.Name = input.name;
+  if (input.fullyQualifiedName) qbo.FullyQualifiedName = input.fullyQualifiedName;
+  if (input.accountType) qbo.AccountType = input.accountType;           // e.g., "Bank", "Accounts Receivable", ...
+  if (input.accountSubType) qbo.AccountSubType = input.accountSubType;  // e.g., "Checking", "AccountsReceivable", ...
+  if (input.description) qbo.Description = input.description;
+  if (input.classification) qbo.Classification = input.classification;  // e.g., "Asset", "Liability", "Equity", "Income", "Expense"
+  if (input.accountNumber) qbo.AcctNum = input.accountNumber;
+  if (typeof input.taxCodeRef === "string") qbo.TaxCodeRef = { value: input.taxCodeRef };
+  if (input.currencyRef) qbo.CurrencyRef = { value: input.currencyRef }; // e.g., "USD"
+  if (typeof input.subAccount === "boolean") qbo.SubAccount = input.subAccount;
+  if (input.parentRef) qbo.ParentRef = { value: input.parentRef }; // parent Account.Id
+  if (typeof input.currentBalance === "number") qbo.CurrentBalance = input.currentBalance; // usually read-only; avoid on create
+  if (typeof input.active === "boolean") qbo.Active = input.active;
+
+  return qbo;
+}
+
 // --- Zod Schemas ---
 
 const paginationSchema = z.object({
   startPosition: z.number().int().min(1).default(1).describe("Query start position (1-based)"),
   maxResults: z.number().int().min(1).max(1000).default(50).describe("Max results (1-1000)"),
+});
+
+const accountPaginationSchema = z.object({
+  startPosition: z.number().int().min(1).default(1),
+  maxResults: z.number().int().min(1).max(1000).default(50),
 });
 
 // For create (DisplayName required)
@@ -351,6 +384,50 @@ const searchSchema = z.object({
   phone: z.string().optional(),
   activeOnly: z.boolean().default(true),
   orderBy: z.enum(["Id", "DisplayName", "Metadata.LastUpdatedTime"]).default("Metadata.LastUpdatedTime"),
+  sort: z.enum(["ASC", "DESC"]).default("DESC"),
+});
+
+const accountCreateSchema = z.object({
+  name: z.string().min(1).describe("Account Name"),
+  accountType: z.string().min(1).describe("QBO AccountType (e.g., Bank, Accounts Receivable, Income, Expense)"),
+  accountSubType: z.string().optional().describe("QBO AccountSubType (e.g., Checking, AccountsReceivable)"),
+  description: z.string().optional(),
+  classification: z.string().optional().describe("Asset | Liability | Equity | Income | Expense"),
+  accountNumber: z.string().optional(),
+  currencyRef: z.string().optional().describe("ISO currency code (e.g., USD)"),
+  subAccount: z.boolean().optional(),
+  parentRef: z.string().optional().describe("Parent Account Id (only if subAccount=true)"),
+  taxCodeRef: z.string().optional(),
+  active: z.boolean().optional(),
+});
+
+const accountUpdateSchema = z.object({
+  accountId: z.string().min(1).describe("Account Id to update"),
+  sparse: z.boolean().default(true),
+  name: z.string().optional(),
+  accountType: z.string().optional(),
+  accountSubType: z.string().optional(),
+  description: z.string().optional(),
+  classification: z.string().optional(),
+  accountNumber: z.string().optional(),
+  currencyRef: z.string().optional(),
+  subAccount: z.boolean().optional(),
+  parentRef: z.string().optional(),
+  taxCodeRef: z.string().optional(),
+  active: z.boolean().optional(),
+});
+
+const accountSearchSchema = z.object({
+  startPosition: accountPaginationSchema.shape.startPosition,
+  maxResults: accountPaginationSchema.shape.maxResults,
+  name: z.string().optional(),
+  accountType: z.string().optional(),
+  accountSubType: z.string().optional(),
+  classification: z.string().optional(),
+  activeOnly: z.boolean().default(true),
+  orderBy: z
+    .enum(["Id", "Name", "FullyQualifiedName", "Metadata.LastUpdatedTime"])
+    .default("Metadata.LastUpdatedTime"),
   sort: z.enum(["ASC", "DESC"]).default("DESC"),
 });
 
@@ -540,10 +617,124 @@ async function main() {
     }
   );
 
+  server.tool(
+    "get_account_by_id",
+    "Fetch a QuickBooks account by ID",
+    { accountId: z.string().describe("The QuickBooks Account ID") },
+    async ({ accountId }) => {
+      const data = await qbRequest(`account/${accountId}`, { method: "GET" });
+      const account = data?.Account ?? data;
+      return { content: [{ type: "text", text: JSON.stringify(account, null, 2) }] };
+    }
+  );
+  
+  // List accounts (paged)
+  server.tool(
+    "list_accounts",
+    "List accounts with pagination (uses QBO query endpoint)",
+    accountPaginationSchema.shape,
+    async ({ startPosition, maxResults }) => {
+      const sql = `SELECT * FROM Account ORDER BY Metadata.LastUpdatedTime DESC STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`;
+      const data = await qbQuery(sql);
+      const accounts = data?.QueryResponse?.Account ?? [];
+      return { content: [{ type: "text", text: JSON.stringify(accounts, null, 2) }] };
+    }
+  );
+  
+  // Search accounts
+  server.tool(
+    "search_accounts",
+    "Search accounts by name/type/subtype/classification with optional pagination",
+    accountSearchSchema.shape,
+    async ({ name, accountType, accountSubType, classification, activeOnly, startPosition, maxResults, orderBy, sort }) => {
+      const parts: string[] = [];
+      const esc = (s: string) => s.replace(/'/g, "\\'");
+  
+      if (typeof activeOnly === "boolean") parts.push(`Active = ${activeOnly ? "true" : "false"}`);
+      if (name) parts.push(`Name LIKE '${esc(name)}%'`);
+      if (accountType) parts.push(`AccountType = '${esc(accountType)}'`);
+      if (accountSubType) parts.push(`AccountSubType = '${esc(accountSubType)}'`);
+      if (classification) parts.push(`Classification = '${esc(classification)}'`);
+  
+      const where = parts.length ? ` WHERE ${parts.join(" AND ")}` : "";
+      const sql = `SELECT * FROM Account${where} ORDER BY ${orderBy} ${sort} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`;
+      const data = await qbQuery(sql);
+      const accounts = data?.QueryResponse?.Account ?? [];
+      return { content: [{ type: "text", text: JSON.stringify(accounts, null, 2) }] };
+    }
+  );
+  
+  // Create account
+  server.tool(
+    "create_account",
+    "Create a new QuickBooks account",
+    accountCreateSchema.shape,
+    async (input) => {
+      const body = mapAccountInputToQBO(input);
+      const data = await qbRequest("account", { method: "POST", body });
+      const created = data?.Account ?? data;
+      return { content: [{ type: "text", text: JSON.stringify(created, null, 2) }] };
+    }
+  );
+  
+  // Update account (sparse by default)
+  server.tool(
+    "update_account",
+    "Update an existing QuickBooks account (sparse update by default)",
+    accountUpdateSchema.shape,
+    async (input) => {
+      const { accountId, sparse = true, ...patch } = input as any;
+  
+      // get latest SyncToken
+      const existing = await getAccountRaw(accountId);
+      if (!existing?.Id || existing.SyncToken === undefined) {
+        throw new Error("Could not fetch existing account or SyncToken.");
+      }
+  
+      const body = {
+        Id: existing.Id,
+        SyncToken: existing.SyncToken,
+        ...(sparse ? { sparse: true } : {}),
+        ...mapAccountInputToQBO(patch),
+      };
+  
+      const data = await qbRequest("account?operation=update", { method: "POST", body });
+      const updated = data?.Account ?? data;
+      return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+    }
+  );
+  
+  // Activate/Deactivate account
+  server.tool(
+    "set_account_active",
+    "Activate or deactivate an account (Active=true/false)",
+    {
+      accountId: z.string().describe("Account Id"),
+      active: z.boolean().describe("Set Active true/false"),
+    },
+    async ({ accountId, active }) => {
+      const existing = await getAccountRaw(accountId);
+      if (!existing?.Id || existing.SyncToken === undefined) {
+        throw new Error("Could not fetch existing account or SyncToken.");
+      }
+  
+      const body = {
+        Id: existing.Id,
+        SyncToken: existing.SyncToken,
+        sparse: true,
+        Active: active,
+      };
+  
+      const data = await qbRequest("account?operation=update", { method: "POST", body });
+      const updated = data?.Account ?? data;
+      return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+    }
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    "QuickBooks MCP server running with tools: get_customer_by_id, list_customers, search_customers, create_customer, update_customer, set_customer_active, get_customer_by_display_name"
+    "QuickBooks MCP server running"
   );
 }
 
